@@ -1,0 +1,74 @@
+#include <Arduino.h>
+#include "SPI.h"
+#include "TFT_eSPI.h"
+
+
+#define LED_GPIO   17
+#define PWM1_Ch    0
+#define PWM1_Res   8
+#define PWM1_Freq  1000
+
+#define PEDAL_SENSOR 27
+
+int PWM1_DutyCycle = 0;
+
+
+
+TFT_eSPI tft = TFT_eSPI();
+
+
+
+void setup() {
+  Serial.begin(9600);
+  while (!Serial);
+
+  unsigned long start = millis();
+
+  tft.init();
+
+  ledcAttachPin(LED_GPIO, PWM1_Ch);
+  ledcSetup(PWM1_Ch, PWM1_Freq, PWM1_Res);
+  ledcWrite(PWM1_Ch, 255);
+
+  pinMode(PEDAL_SENSOR, INPUT);
+
+  tft.fillScreen(TFT_BLACK);
+}
+
+
+static unsigned long last = millis();
+static unsigned long freq = 0;
+static unsigned long count = 0;
+unsigned long now = millis();
+bool on_last = false;
+
+void loop(void) {
+  if (digitalRead(PEDAL_SENSOR) == LOW) {
+    tft.fillRect(50, 50, 50, 50, TFT_GREEN);
+    if (!on_last) {
+      count++;
+    }
+    on_last = true;
+  }
+  else {
+    tft.fillRect(50, 50, 50, 50, TFT_RED);
+    on_last = false;
+  }
+
+  // calculate rolling frequency over the last 3 seconds
+  now = millis();
+  if (now - last > 1000) {
+    freq = count;
+    count = 0;
+    last = now;
+  }
+  
+  
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextSize(2);
+  tft.setCursor(0, 0);
+  tft.print("Frequency: ");
+  tft.print(freq);
+  tft.print(" Hz");
+  
+}

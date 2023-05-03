@@ -1,0 +1,328 @@
+#include <Arduino.h>
+#include "SPI.h"
+#include "TFT_eSPI.h"
+
+#include <WiFi.h>
+#include <ESPmDNS.h>
+#include <WiFiUdp.h>
+#include <ArduinoOTA.h>
+
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <Wire.h>
+
+
+const char* ssid = "VM2735A8";
+const char* password = "dma3ckbKyyfQ";
+// 192.168.0.39
+
+#define LCD_LED_GPIO   17
+#define PWM1_Ch    0
+#define PWM1_Res   8
+#define PWM1_Freq  1000
+
+#define WHEEL_SENSOR 26
+#define PEDAL_SENSOR 27
+
+int PWM1_DutyCycle = 0;
+
+static uint32_t last_wheel = 1;
+static uint32_t last_last_wheel = 0;
+static uint32_t last_five_wheel[5] = {0, 1, 2, 3, 4};
+
+static uint32_t last_pedal = 1;
+static uint32_t last_last_pedal = 0;
+static uint32_t last_five_pedal[5] = {0, 1, 2, 3, 4};
+
+TFT_eSPI tft = TFT_eSPI();
+Adafruit_MPU6050 mpu;
+
+
+void pedal_interrupt() {
+
+  //if less than 20ms since last interrupt, ignore it
+  if (millis() - last_pedal < 20) return;
+
+  last_last_pedal = last_pedal;
+  last_pedal = millis(); 
+
+  //shuffle along the array
+  for (int i = 0; i < 4; i++) {
+    last_five_pedal[i] = last_five_pedal[i+1];
+  }
+  last_five_pedal[4] = last_pedal; 
+
+}
+
+void wheel_interrupt() {
+
+  //if less than 20ms since last interrupt, ignore it
+  if (millis() - last_wheel < 100) return;
+
+  last_last_wheel = last_wheel;
+  last_wheel = millis();
+
+  //shuffle along the array
+  for (int i = 0; i < 4; i++) {
+    last_five_wheel[i] = last_five_wheel[i+1];
+  }
+  last_five_wheel[4] = last_wheel;
+
+}
+
+
+uint32_t averaged_pedal_speed() {
+  int total = 0;
+  for (int i = 0; i < 4; i++) {
+    total += last_five_pedal[i+1] - last_five_pedal[i];
+  }
+
+  //convert to rpm
+  return (total / 4);
+}
+
+uint32_t averaged_wheel_speed() {
+  int total = 0;
+  for (int i = 0; i < 4; i++) {
+    total += last_five_wheel[i+1] - last_five_wheel[i];
+  }
+  
+  //convert to rpm
+  return (total / 4);
+}
+
+uint32_t pedal_speed() {
+  return (last_pedal - last_last_pedal);
+}
+
+uint32_t wheel_speed() {
+  return last_wheel - last_last_wheel;
+}
+
+uint32_t pedal_to_rpm(uint32_t pedal_speed) {
+  return (8*60000) / pedal_speed;
+}
+
+uint32_t wheel_to_rpm(uint32_t wheel_speed) {
+  return 60000 / wheel_speed;
+}
+
+
+void setup() {
+  // This lets us measure the boot time
+  tft.init();
+  tft.fillScreen(TFT_WHITE);
+
+  // Init serial
+  Serial.begin(9600);
+  while (!Serial);
+
+  // Init Wifi
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  while (WiFi.waitForConnectResult() != WL_CONNECTED) {
+    Serial.println("Connection Failed! Rebooting...");
+    delay(2000);
+    ESP.restart();
+  }
+
+  // Init OTA
+  ArduinoOTA
+    .onStart([]() {
+      String type;
+      if (ArduinoOTA.getCommand() == U_FLASH)
+        type = "sketch";
+      else // U_SPIFFS
+        type = "filesystem";
+
+      // NOTE: if updating SPIFFS this would be the place to unmount SPIFFS using SPIFFS.end()
+      Serial.println("Start updating " + type);
+    })
+    .onEnd([]() {
+      Serial.println("\nEnd");
+    })
+    .onProgress([](unsigned int progress, unsigned int total) {
+      Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+    })
+    .onError([](ota_error_t error) {
+      Serial.printf("Error[%u]: ", error);
+      if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+      else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+      else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+      else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+      else if (error == OTA_END_ERROR) Serial.println("End Failed");
+    });
+
+  ArduinoOTA.begin();
+
+  Serial.println("Ready");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+
+  // Quick update check
+  for (int i = 0; i < 100; i++) {
+    ArduinoOTA.handle();
+    delay(10);
+  }
+
+  // Init LCD backlight
+  ledcAttachPin(LCD_LED_GPIO, PWM1_Ch);
+  ledcSetup(PWM1_Ch, PWM1_Freq, PWM1_Res);
+  ledcWrite(PWM1_Ch, 255);
+
+  // Init sensors pins
+  pinMode(PEDAL_SENSOR, INPUT);
+  pinMode(WHEEL_SENSOR, INPUT);
+
+  // Init sensors interrupts
+  attachInterrupt(PEDAL_SENSOR, pedal_interrupt, RISING);
+  attachInterrupt(WHEEL_SENSOR, wheel_interrupt, RISING);
+
+  // Init MPU
+  mpu.begin();
+  mpu.setAccelerometerRange(MPU6050_RANGE_2_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_5_HZ);
+
+
+
+  // Finish setting up LCD
+  tft.setRotation(3);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextSize(2);
+  tft.fillScreen(TFT_BLACK);
+}
+
+
+void loop() {
+  tft.setCursor(0, 0);
+  // tft.print("Pedal speed: ");
+  // tft.print(pedal_speed());
+  // tft.println("ms     ");
+
+  // tft.print("Avg pedal speed: ");
+  // tft.print(averaged_pedal_speed());
+  // tft.println("ms     ");
+
+  // tft.print("Wheel speed: ");
+  // tft.print(wheel_speed());
+  // tft.println("ms     ");
+
+  // tft.print("Avg wheel speed: ");
+  // tft.print(averaged_wheel_speed());
+  // tft.println("ms     ");
+
+  // //print array for debugging
+  // for (int i = 0; i < 5; i++) {
+  //   tft.print(last_five_wheel[i]);
+  //   tft.print(" ");
+  // }
+  // tft.println(" ");
+
+
+
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+
+  /* Print out the values */
+  // Serial.print("Acceleration X: ");
+  // Serial.print(a.acceleration.x);
+  // Serial.print(", Y: ");
+  // Serial.print("\t");
+  // Serial.print(a.acceleration.y);
+  // Serial.print(", Z: ");
+  // Serial.print("\t");
+  // Serial.println(a.acceleration.z);
+  // Serial.println(" m/s^2");
+
+  // Serial.print("Rotation X: ");
+  // Serial.print(g.gyro.x);
+  // Serial.print(", Y: ");
+  // Serial.print(g.gyro.y);
+  // Serial.print(", Z: ");
+  // Serial.print(g.gyro.z);
+  // Serial.println(" rad/s");
+
+  // Serial.print("Temperature: ");
+  // Serial.print(temp.temperature);
+  // Serial.println(" degC");
+
+  // Serial.println("");
+
+  #define ACCEL_GAIN 10
+  #define GYRO_GAIN 40
+  #define HEIGHT 30
+
+  if (a.acceleration.x > 0) {
+    tft.fillRect(160, 0, a.acceleration.x*ACCEL_GAIN, HEIGHT, TFT_RED);
+    tft.fillRect(160+(a.acceleration.x*ACCEL_GAIN), 0, 160-(a.acceleration.x*ACCEL_GAIN), HEIGHT, TFT_BLACK);
+    tft.fillRect(0, 0, 160, HEIGHT, TFT_BLACK);
+  }
+  else {
+    tft.fillRect(160+(a.acceleration.x*ACCEL_GAIN), 0, -a.acceleration.x*ACCEL_GAIN, HEIGHT, TFT_RED);
+    tft.fillRect(0, 0, 160+(a.acceleration.x*ACCEL_GAIN), HEIGHT, TFT_BLACK);
+    tft.fillRect(160, 0, 160, HEIGHT, TFT_BLACK);
+  }
+
+  if (a.acceleration.y > 0) {
+    tft.fillRect(160, HEIGHT, a.acceleration.y*ACCEL_GAIN, HEIGHT, TFT_GREEN);
+    tft.fillRect(160+(a.acceleration.y*ACCEL_GAIN), HEIGHT, 160-(a.acceleration.y*ACCEL_GAIN), HEIGHT, TFT_BLACK);
+    tft.fillRect(0, HEIGHT, 160, HEIGHT, TFT_BLACK);
+  }
+  else {
+    tft.fillRect(160+(a.acceleration.y*ACCEL_GAIN), HEIGHT, -a.acceleration.y*ACCEL_GAIN, HEIGHT, TFT_GREEN);
+    tft.fillRect(0, HEIGHT, 160+(a.acceleration.y*ACCEL_GAIN), HEIGHT, TFT_BLACK);
+    tft.fillRect(160, HEIGHT, 160, HEIGHT, TFT_BLACK);
+  }
+
+  if (a.acceleration.z > 0) {
+    tft.fillRect(160, HEIGHT*2, a.acceleration.z*ACCEL_GAIN, HEIGHT, TFT_BLUE);
+    tft.fillRect(160+(a.acceleration.z*ACCEL_GAIN), HEIGHT*2, 160-(a.acceleration.z*ACCEL_GAIN), HEIGHT, TFT_BLACK);
+    tft.fillRect(0, HEIGHT*2, 160, HEIGHT, TFT_BLACK);
+  }
+  else {
+    tft.fillRect(160+(a.acceleration.z*ACCEL_GAIN), HEIGHT*2, -a.acceleration.z*ACCEL_GAIN, HEIGHT, TFT_BLUE);
+    tft.fillRect(0, HEIGHT*2, 160+(a.acceleration.z*ACCEL_GAIN), HEIGHT, TFT_BLACK);
+    tft.fillRect(160, HEIGHT*2, 160, HEIGHT, TFT_BLACK);
+  }
+
+  if (g.gyro.x > 0) {
+    tft.fillRect(160, HEIGHT*4, g.gyro.x*GYRO_GAIN, HEIGHT, TFT_RED);
+    tft.fillRect(160+(g.gyro.x*GYRO_GAIN), HEIGHT*4, 160-(g.gyro.x*GYRO_GAIN), HEIGHT, TFT_BLACK);
+    tft.fillRect(0, HEIGHT*4, 160, HEIGHT, TFT_BLACK);
+  }
+  else {
+    tft.fillRect(160+(g.gyro.x*GYRO_GAIN), HEIGHT*4, -g.gyro.x*GYRO_GAIN, HEIGHT, TFT_RED);
+    tft.fillRect(0, HEIGHT*4, 160+(g.gyro.x*GYRO_GAIN), HEIGHT, TFT_BLACK);
+    tft.fillRect(160, HEIGHT*4, 160, HEIGHT, TFT_BLACK);
+  }
+
+  if (g.gyro.y > 0) {
+    tft.fillRect(160, HEIGHT*5, g.gyro.y*GYRO_GAIN, HEIGHT, TFT_GREEN);
+    tft.fillRect(160+(g.gyro.y*GYRO_GAIN), HEIGHT*5, 160-(g.gyro.y*GYRO_GAIN), HEIGHT, TFT_BLACK);
+    tft.fillRect(0, HEIGHT*5, 160, HEIGHT, TFT_BLACK);
+  }
+  else {
+    tft.fillRect(160+(g.gyro.y*GYRO_GAIN), HEIGHT*5, -g.gyro.y*GYRO_GAIN, HEIGHT, TFT_GREEN);
+    tft.fillRect(0, HEIGHT*5, 160+(g.gyro.y*GYRO_GAIN), HEIGHT, TFT_BLACK);
+    tft.fillRect(160, HEIGHT*5, 160, HEIGHT, TFT_BLACK);
+  }
+
+  if (g.gyro.z > 0) {
+    tft.fillRect(160, HEIGHT*6, g.gyro.z*GYRO_GAIN, HEIGHT, TFT_BLUE);
+    tft.fillRect(160+(g.gyro.z*GYRO_GAIN), HEIGHT*6, 160-(g.gyro.z*GYRO_GAIN), HEIGHT, TFT_BLACK);
+    tft.fillRect(0, HEIGHT*6, 160, HEIGHT, TFT_BLACK);
+  }
+  else {
+    tft.fillRect(160+(g.gyro.z*GYRO_GAIN), HEIGHT*6, -g.gyro.z*GYRO_GAIN, HEIGHT, TFT_BLUE);
+    tft.fillRect(0, HEIGHT*6, 160+(g.gyro.z*GYRO_GAIN), HEIGHT, TFT_BLACK);
+    tft.fillRect(160, HEIGHT*6, 160, HEIGHT, TFT_BLACK);
+  }
+
+
+
+  
+
+  ArduinoOTA.handle();
+  // delay(300);
+}
